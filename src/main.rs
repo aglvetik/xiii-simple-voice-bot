@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
-use chrono::Utc;
+use chrono::{Local, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serenity::{
     all::{
@@ -148,6 +148,7 @@ impl BotState {
 
         Ok(Some(ClosedSession {
             channel_id,
+            joined_at,
             duration_seconds,
         }))
     }
@@ -336,7 +337,7 @@ impl BotState {
     async fn panel_description(&self, now: i64) -> Result<String> {
         let rows = self.panel_rows(now).await?;
         if rows.is_empty() {
-            return Ok("No voice activity yet.".to_string());
+            return Ok("Пока нет голосовой активности.".to_string());
         }
 
         let lines = rows
@@ -511,6 +512,14 @@ impl Handler {
             return Ok(());
         }
 
+        if old_channel == Some(self.state.config.create_voice_channel_id) {
+            if let Some(channel_id) = new_channel {
+                if self.state.is_temp_channel(channel_id).await? {
+                    return Ok(());
+                }
+            }
+        }
+
         let Some(member) = self.member_for_voice_state(ctx, &new).await else {
             return Ok(());
         };
@@ -530,11 +539,20 @@ impl Handler {
                         channel_id = room_id.get(),
                         "created temporary voice room"
                     );
-                    if old_channel.is_some() {
-                        let _ = self.state.close_session(member.user.id, now).await?;
-                    }
+                    let closed = if old_channel.is_some() {
+                        self.state.close_session(member.user.id, now).await?
+                    } else {
+                        None
+                    };
+                    self.state
+                        .open_session(member.user.id, room_id, now)
+                        .await?;
                     if let Some(channel_id) = old_channel {
+                        self.log_move(ctx, &member, channel_id, room_id, closed.as_ref(), now)
+                            .await;
                         self.cleanup_temp_channel_if_empty(ctx, channel_id).await?;
+                    } else {
+                        self.log_join(ctx, &member, room_id, now).await;
                     }
                     self.state.refresh_panel(ctx).await?;
                     return Ok(());
@@ -558,22 +576,28 @@ impl Handler {
             }
             (Some(channel_id), None) => {
                 let closed = self.state.close_session(member.user.id, now).await?;
-                let duration_seconds = closed
-                    .as_ref()
-                    .map(|session| session.duration_seconds)
-                    .unwrap_or(0);
                 let logged_channel_id = closed
+                    .as_ref()
                     .and_then(|session| session.channel_id)
                     .unwrap_or(channel_id);
-                self.log_leave(ctx, &member, logged_channel_id, duration_seconds, now)
+                self.log_leave(ctx, &member, logged_channel_id, closed.as_ref(), now)
                     .await;
                 self.cleanup_temp_channel_if_empty(ctx, channel_id).await?;
             }
             (Some(old_channel_id), Some(new_channel_id)) => {
-                let _ = self.state.close_session(member.user.id, now).await?;
+                let closed = self.state.close_session(member.user.id, now).await?;
                 self.state
                     .open_session(member.user.id, new_channel_id, now)
                     .await?;
+                self.log_move(
+                    ctx,
+                    &member,
+                    old_channel_id,
+                    new_channel_id,
+                    closed.as_ref(),
+                    now,
+                )
+                .await;
                 self.cleanup_temp_channel_if_empty(ctx, old_channel_id)
                     .await?;
             }
@@ -710,12 +734,10 @@ impl Handler {
 
     async fn log_join(&self, ctx: &Context, member: &Member, channel_id: ChannelId, now: i64) {
         let embed = CreateEmbed::new()
-            .title("Voice joined")
-            .description(format!(
-                "{} joined {}",
-                user_mention(member.user.id),
-                channel_mention(channel_id)
-            ))
+            .title("Вход в голосовой канал")
+            .field("Пользователь", user_mention(member.user.id), false)
+            .field("Канал", channel_mention(channel_id), false)
+            .field("Вошёл", format_timestamp(now), false)
             .timestamp(timestamp(now))
             .color(0x57F287);
 
@@ -727,19 +749,51 @@ impl Handler {
         ctx: &Context,
         member: &Member,
         channel_id: ChannelId,
-        duration_seconds: i64,
+        closed: Option<&ClosedSession>,
         now: i64,
     ) {
+        let joined_at = closed
+            .map(|session| format_timestamp(session.joined_at))
+            .unwrap_or_else(|| "неизвестно".to_string());
+        let duration = closed
+            .map(|session| format_duration(session.duration_seconds))
+            .unwrap_or_else(|| "неизвестно".to_string());
+
         let embed = CreateEmbed::new()
-            .title("Voice left")
-            .description(format!(
-                "{} left {}\nDuration: {}",
-                user_mention(member.user.id),
-                channel_mention(channel_id),
-                format_duration(duration_seconds)
-            ))
+            .title("Выход из голосового канала")
+            .field("Пользователь", user_mention(member.user.id), false)
+            .field("Канал", channel_mention(channel_id), false)
+            .field("Вошёл", joined_at, false)
+            .field("Вышел", format_timestamp(now), false)
+            .field("Пробыл", duration, false)
             .timestamp(timestamp(now))
             .color(0xED4245);
+
+        self.state.send_log_embed(ctx, embed).await;
+    }
+
+    async fn log_move(
+        &self,
+        ctx: &Context,
+        member: &Member,
+        old_channel_id: ChannelId,
+        new_channel_id: ChannelId,
+        closed: Option<&ClosedSession>,
+        now: i64,
+    ) {
+        let duration = closed
+            .map(|session| format_duration(session.duration_seconds))
+            .unwrap_or_else(|| "неизвестно".to_string());
+
+        let embed = CreateEmbed::new()
+            .title("Переход между голосовыми каналами")
+            .field("Пользователь", user_mention(member.user.id), false)
+            .field("Из", channel_mention(old_channel_id), false)
+            .field("В", channel_mention(new_channel_id), false)
+            .field("Время", format_timestamp(now), false)
+            .field("В прошлом канале пробыл", duration, false)
+            .timestamp(timestamp(now))
+            .color(0xFEE75C);
 
         self.state.send_log_embed(ctx, embed).await;
     }
@@ -747,6 +801,7 @@ impl Handler {
 
 struct ClosedSession {
     channel_id: Option<ChannelId>,
+    joined_at: i64,
     duration_seconds: i64,
 }
 
@@ -854,26 +909,40 @@ fn timestamp(unix_seconds: i64) -> Timestamp {
 
 fn build_panel_embed(description: String, now: i64) -> CreateEmbed {
     CreateEmbed::new()
-        .title("All-time voice activity")
+        .title("Голосовая активность — всё время")
         .description(description)
         .footer(CreateEmbedFooter::new(format!(
-            "Last update: {}",
-            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            "Обновлено: {}",
+            format_timestamp(now)
         )))
         .timestamp(timestamp(now))
         .color(0x5865F2)
 }
 
 fn format_duration(seconds: i64) -> String {
-    let total_minutes = (seconds.max(0)) / 60;
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        return "меньше минуты".to_string();
+    }
+
+    let total_minutes = seconds / 60;
     let hours = total_minutes / 60;
     let minutes = total_minutes % 60;
 
     if hours > 0 {
-        format!("{hours}h {minutes}m")
+        format!("{hours} ч {minutes} мин")
     } else {
-        format!("{minutes}m")
+        format!("{minutes} мин")
     }
+}
+
+fn format_timestamp(unix_seconds: i64) -> String {
+    Local
+        .timestamp_opt(unix_seconds, 0)
+        .single()
+        .unwrap_or_else(Local::now)
+        .format("%d.%m.%Y %H:%M")
+        .to_string()
 }
 
 fn user_mention(user_id: UserId) -> String {
