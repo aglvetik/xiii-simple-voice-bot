@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const PANEL_SETTING_KEY: &str = "panel_message_id";
+const PANEL_CHANNEL_SETTING_KEY: &str = "panel_channel_id";
 
 #[derive(Clone)]
 struct Config {
@@ -204,6 +205,35 @@ impl BotState {
         Ok(())
     }
 
+    async fn stored_panel_reference(&self) -> Result<Option<(ChannelId, MessageId)>> {
+        let message_id = self
+            .get_setting(PANEL_SETTING_KEY)
+            .await?
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(MessageId::new);
+
+        let channel_id = self
+            .get_setting(PANEL_CHANNEL_SETTING_KEY)
+            .await?
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(ChannelId::new)
+            .unwrap_or(self.config.panel_channel_id);
+
+        Ok(message_id.map(|message_id| (channel_id, message_id)))
+    }
+
+    async fn save_panel_reference(
+        &self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> Result<()> {
+        self.set_setting(PANEL_CHANNEL_SETTING_KEY, &channel_id.get().to_string())
+            .await?;
+        self.set_setting(PANEL_SETTING_KEY, &message_id.get().to_string())
+            .await?;
+        Ok(())
+    }
+
     async fn panel_rows(&self, now: i64) -> Result<Vec<PanelRow>> {
         let db = self.db.lock().await;
         let mut stmt = db.prepare(
@@ -294,27 +324,39 @@ impl BotState {
         let _guard = self.panel_lock.lock().await;
         let now = now_unix();
         let description = self.panel_description(now).await?;
-        let existing_message_id = self
-            .get_setting(PANEL_SETTING_KEY)
-            .await?
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(MessageId::new);
-
-        if let Some(message_id) = existing_message_id {
-            let edit = EditMessage::new().embed(build_panel_embed(description.clone(), now));
-            match self
-                .config
-                .panel_channel_id
-                .edit_message(&ctx.http, message_id, edit)
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(err) => {
+        if let Some((channel_id, message_id)) = self.stored_panel_reference().await? {
+            match channel_id.message(&ctx.http, message_id).await {
+                Ok(_) => {
+                    let edit =
+                        EditMessage::new().embed(build_panel_embed(description.clone(), now));
+                    match channel_id.edit_message(&ctx.http, message_id, edit).await {
+                        Ok(_) => {
+                            self.save_panel_reference(channel_id, message_id).await?;
+                            return Ok(());
+                        }
+                        Err(err) if is_not_found_error(&err) => {
+                            warn!(
+                                channel_id = channel_id.get(),
+                                message_id = message_id.get(),
+                                error = %err,
+                                "stored panel message disappeared during update; recreating it"
+                            );
+                        }
+                        Err(err) => {
+                            return Err(anyhow!(err).context("failed to edit stored panel message"));
+                        }
+                    }
+                }
+                Err(err) if is_not_found_error(&err) => {
                     warn!(
+                        channel_id = channel_id.get(),
                         message_id = message_id.get(),
                         error = %err,
-                        "failed to edit stored panel message; creating a new one"
+                        "stored panel message was not found; creating a new one"
                     );
+                }
+                Err(err) => {
+                    return Err(anyhow!(err).context("failed to fetch stored panel message"));
                 }
             }
         }
@@ -329,7 +371,7 @@ impl BotState {
             .await
             .context("failed to create panel message")?;
 
-        self.set_setting(PANEL_SETTING_KEY, &message.id.get().to_string())
+        self.save_panel_reference(self.config.panel_channel_id, message.id)
             .await?;
         Ok(())
     }
@@ -943,6 +985,14 @@ fn format_timestamp(unix_seconds: i64) -> String {
         .unwrap_or_else(Local::now)
         .format("%d.%m.%Y %H:%M")
         .to_string()
+}
+
+fn is_not_found_error(error: &serenity::Error) -> bool {
+    matches!(
+        error,
+        serenity::Error::Http(http_error)
+            if http_error.status_code() == Some(serenity::http::StatusCode::NOT_FOUND)
+    )
 }
 
 fn user_mention(user_id: UserId) -> String {
