@@ -1,4 +1,4 @@
-use std::env;
+﻿use std::env;
 
 use anyhow::{Context as AnyhowContext, Result};
 use serenity::all::{ChannelId, GuildId};
@@ -45,10 +45,7 @@ impl Config {
             create_voice_channel_id: ChannelId::new(parse_env_u64("CREATE_VOICE_CHANNEL_ID")?),
             database_path: env::var("DATABASE_PATH")
                 .unwrap_or_else(|_| "data/voicebot.sqlite".to_string()),
-            panel_update_seconds: env::var("PANEL_UPDATE_SECONDS")
-                .unwrap_or_else(|_| "15".to_string())
-                .parse()
-                .context("PANEL_UPDATE_SECONDS must be an integer")?,
+            panel_update_seconds: parse_env_u64_or_default("PANEL_UPDATE_SECONDS", 15)?,
             ai: AiConfig {
                 channel_id: ChannelId::new(parse_env_u64_or_default(
                     "AI_CHANNEL_ID",
@@ -80,7 +77,16 @@ impl Config {
 }
 
 fn require_env(name: &str) -> Result<String> {
-    env::var(name).with_context(|| format!("{name} is required"))
+    let value = env::var(name)
+        .with_context(|| format!("{name} is required"))?
+        .trim()
+        .to_string();
+
+    if value.is_empty() {
+        anyhow::bail!("{name} is required");
+    }
+
+    Ok(value)
 }
 
 fn parse_env_u64(name: &str) -> Result<u64> {
@@ -91,27 +97,51 @@ fn parse_env_u64(name: &str) -> Result<u64> {
 
 fn parse_env_u64_or_default(name: &str, default: u64) -> Result<u64> {
     match env::var(name) {
-        Ok(value) => value
-            .parse::<u64>()
-            .with_context(|| format!("{name} must be an integer")),
+        Ok(value) => {
+            let value = value.trim();
+
+            if value.is_empty() || value == "0" {
+                Ok(default)
+            } else {
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("{name} must be an integer"))
+            }
+        }
         Err(_) => Ok(default),
     }
 }
 
 fn parse_env_u32_or_default(name: &str, default: u32) -> Result<u32> {
     match env::var(name) {
-        Ok(value) => value
-            .parse::<u32>()
-            .with_context(|| format!("{name} must be an integer")),
+        Ok(value) => {
+            let value = value.trim();
+
+            if value.is_empty() {
+                Ok(default)
+            } else {
+                value
+                    .parse::<u32>()
+                    .with_context(|| format!("{name} must be an integer"))
+            }
+        }
         Err(_) => Ok(default),
     }
 }
 
 fn parse_env_usize_or_default(name: &str, default: usize) -> Result<usize> {
     match env::var(name) {
-        Ok(value) => value
-            .parse::<usize>()
-            .with_context(|| format!("{name} must be an integer")),
+        Ok(value) => {
+            let value = value.trim();
+
+            if value.is_empty() {
+                Ok(default)
+            } else {
+                value
+                    .parse::<usize>()
+                    .with_context(|| format!("{name} must be an integer"))
+            }
+        }
         Err(_) => Ok(default),
     }
 }
@@ -122,3 +152,4 @@ fn optional_env(name: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
+
