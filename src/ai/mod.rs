@@ -48,7 +48,7 @@ pub(crate) async fn handle_ai_message(
     let history = history::build_ai_history(ctx, msg, state.config.ai.history_limit).await?;
 
     match deepseek::request_deepseek(state, api_key, history).await {
-        Ok(response) => messages::send_ai_response(ctx, msg.channel_id, &response).await,
+        Ok(response) => messages::send_ai_response(ctx, msg, &response).await,
         Err(err) => {
             warn!(
                 channel_id = msg.channel_id.get(),

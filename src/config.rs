@@ -1,4 +1,4 @@
-﻿use std::env;
+use std::env;
 
 use anyhow::{Context as AnyhowContext, Result};
 use serenity::all::{ChannelId, GuildId};
@@ -152,4 +152,3 @@ fn optional_env(name: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-
